@@ -311,6 +311,40 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
+    // Ollama models are managed by the Ollama daemon — skip download
+    if (isOllamaModel(model)) {
+      const modelName = parseOllamaModelName(model);
+      try {
+        const resp = await fetch(`${OLLAMA_BASE_URL}/api/show`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: modelName }),
+        });
+        if (resp.ok) {
+          results.push({ model, path: `ollama:${modelName}`, sizeBytes: 0, refreshed: false });
+        } else {
+          // Try pulling via Ollama
+          const pullResp = await fetch(`${OLLAMA_BASE_URL}/api/pull`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: modelName, stream: false }),
+          });
+          if (pullResp.ok) {
+            results.push({ model, path: `ollama:${modelName}`, sizeBytes: 0, refreshed: true });
+          } else {
+            throw new Error(`Failed to pull Ollama model: ${modelName}`);
+          }
+        }
+      } catch (error) {
+        throw new Error(
+          `Cannot reach Ollama at ${OLLAMA_BASE_URL}. ` +
+          `Ensure Ollama is running (ollama serve) and the model "${modelName}" is available.\n` +
+          `Original error: ${error}`
+        );
+      }
+      continue;
+    }
+
     let refreshed = false;
     const hfRef = parseHfUri(model);
     const filename = model.split("/").pop();
@@ -357,6 +391,94 @@ export async function pullModels(
     results.push({ model, path, sizeBytes, refreshed });
   }
   return results;
+}
+
+// =============================================================================
+// Ollama Embedding Backend
+// =============================================================================
+
+const OLLAMA_BASE_URL = process.env.OLLAMA_HOST || "http://localhost:11434";
+
+/**
+ * Detect if a model URI uses the Ollama backend.
+ * Format: ollama:<model-name>  (e.g. ollama:nomic-embed-text-v2-moe)
+ */
+export function isOllamaModel(modelUri: string): boolean {
+  return modelUri.startsWith("ollama:");
+}
+
+/**
+ * Extract the Ollama model name from a URI like "ollama:nomic-embed-text-v2-moe".
+ */
+function parseOllamaModelName(modelUri: string): string {
+  return modelUri.slice("ollama:".length);
+}
+
+/**
+ * Embed a single text using the Ollama REST API.
+ * POST /api/embed  (batch-capable endpoint)
+ */
+async function ollamaEmbed(
+  text: string,
+  modelUri: string
+): Promise<EmbeddingResult | null> {
+  const modelName = parseOllamaModelName(modelUri);
+  try {
+    const resp = await fetch(`${OLLAMA_BASE_URL}/api/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelName, input: text }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      console.error(`Ollama embed error (${resp.status}): ${body}`);
+      return null;
+    }
+    const data = await resp.json() as { embeddings: number[][] };
+    if (!data.embeddings || data.embeddings.length === 0) {
+      console.error("Ollama returned empty embeddings");
+      return null;
+    }
+    return { embedding: data.embeddings[0]!, model: modelUri };
+  } catch (error) {
+    console.error("Ollama embed error:", error);
+    return null;
+  }
+}
+
+/**
+ * Batch embed multiple texts using the Ollama REST API.
+ * POST /api/embed with input as string array.
+ */
+async function ollamaEmbedBatch(
+  texts: string[],
+  modelUri: string
+): Promise<(EmbeddingResult | null)[]> {
+  if (texts.length === 0) return [];
+  const modelName = parseOllamaModelName(modelUri);
+  try {
+    const resp = await fetch(`${OLLAMA_BASE_URL}/api/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelName, input: texts }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      console.error(`Ollama embedBatch error (${resp.status}): ${body}`);
+      return texts.map(() => null);
+    }
+    const data = await resp.json() as { embeddings: number[][] };
+    if (!data.embeddings) {
+      return texts.map(() => null);
+    }
+    return data.embeddings.map((emb: number[]) => ({
+      embedding: emb,
+      model: modelUri,
+    }));
+  } catch (error) {
+    console.error("Ollama embedBatch error:", error);
+    return texts.map(() => null);
+  }
 }
 
 // =============================================================================
@@ -910,6 +1032,12 @@ export class LlamaCpp implements LLM {
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    // Ollama: approximate tokenization (chars / 3.5)
+    if (isOllamaModel(this.embedModelUri)) {
+      this._ollamaLastTokenizedText = text;
+      const approxCount = Math.ceil(text.length / 3.5);
+      return Array.from({ length: approxCount }, (_, i) => i as unknown as LlamaToken);
+    }
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -928,7 +1056,18 @@ export class LlamaCpp implements LLM {
   /**
    * Detokenize token IDs back to text
    */
+  /**
+   * For Ollama: stash the original text during tokenize() so detokenize() can truncate.
+   * @internal
+   */
+  private _ollamaLastTokenizedText = "";
+
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    // Ollama: approximate detokenization by character truncation
+    if (isOllamaModel(this.embedModelUri)) {
+      const approxChars = Math.floor(tokens.length * 3.5);
+      return this._ollamaLastTokenizedText.slice(0, approxChars);
+    }
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -947,6 +1086,10 @@ export class LlamaCpp implements LLM {
    * Returns the (possibly truncated) text and whether truncation occurred.
    */
   private resolveEmbedTokenLimit(): number {
+    // Ollama: use model's known context size (nomic = 8192)
+    if (isOllamaModel(this.embedModelUri)) {
+      return 8192;
+    }
     const trainedContextSize = this.embedModel?.trainContextSize;
     if (typeof trainedContextSize === "number" && Number.isFinite(trainedContextSize) && trainedContextSize > 0) {
       return Math.max(1, Math.min(LlamaCpp.EMBED_CONTEXT_SIZE, trainedContextSize));
@@ -973,6 +1116,13 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    // Route to Ollama if configured
+    if (isOllamaModel(this.embedModelUri)) {
+      const result = await ollamaEmbed(text, this.embedModelUri);
+      if (result && options.model) result.model = options.model;
+      return result;
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1003,6 +1153,16 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+
+    // Route to Ollama if configured
+    if (isOllamaModel(this.embedModelUri)) {
+      const results = await ollamaEmbedBatch(texts, this.embedModelUri);
+      if (options.model) {
+        for (const r of results) { if (r) r.model = options.model; }
+      }
+      return results;
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1110,6 +1270,21 @@ export class LlamaCpp implements LLM {
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
+    // Ollama models: check via Ollama API
+    if (isOllamaModel(modelUri)) {
+      const modelName = parseOllamaModelName(modelUri);
+      try {
+        const resp = await fetch(`${OLLAMA_BASE_URL}/api/show`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: modelName }),
+        });
+        return { name: modelUri, exists: resp.ok };
+      } catch {
+        return { name: modelUri, exists: false };
+      }
+    }
+
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
     if (modelUri.startsWith("hf:")) {
