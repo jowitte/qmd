@@ -1305,6 +1305,14 @@ export class LlamaCpp implements LLM {
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+
+    // QMD_NO_EXPAND=1 skips LLM-based expansion, returns direct vec query only
+    if (process.env.QMD_NO_EXPAND === "1") {
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (options.includeLexical ?? true) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
